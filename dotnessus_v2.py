@@ -37,6 +37,7 @@ HOST_DATE_FORMAT = '%a %b %d %H:%M:%S %Y'
 
 # Regex defs
 re_ip = re.compile('\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}')
+re_wmi_ip = re.compile('IPAddress/IPSubnet.*?(?P<value>\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', re.I)
 re_wmi_man = re.compile('Computer Manufacturer : (?P<manufacturer>.*?)\n.*?Computer Model : (?P<model>.*?)\n.*?Computer Memory : (?P<memory>\d+)\s', re.I|re.M|re.S)
 re_shares = re.compile('- (?P<value>.*?)\n', re.I|re.M|re.S)
 re_local_admins = re.compile('- (?P<value>.*?)\s\(', re.I|re.M|re.S)
@@ -48,6 +49,7 @@ re_unix_cpu = re.compile('Current Speed\s+: (?P<cpu_speed>.*?)\s*\nManufacturer\
 # Plugin to regex map
 # Format is plugin_id: (attribute_name, regex_object, attribute_to_parse, multi_valued)
 REGEX_MAP = {
+'24272': ('ips', re_wmi_ip, 'plugin_output', True),
 '25203': ('ips', re_ip, 'plugin_output', True),
 '24270': ('', re_wmi_man, 'description', False),
 '10395': ('shares', re_shares, 'plugin_output', True),
