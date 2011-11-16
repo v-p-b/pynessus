@@ -18,7 +18,10 @@
 # this program; if not, write to the Free Software Foundation, Inc., 59 Temple
 # Place, Suite 330, Boston, MA  02111-1307  USA
 #
-# 2011-03-12:	0.1.1: Initial version.
+# 2011-03-12:	0.1.1: Initial version
+# 2011-03-16:	0.1.3: Added more regex parsers
+# 2011-11-15:   0.2.0: Added better handling of parsing ReportItem attributes and
+#               get_scanned_ip Target method.
 import sys
 import re
 import xml.etree.ElementTree as ET
@@ -41,24 +44,28 @@ re_wmi_ip = re.compile('IPAddress/IPSubnet.*?(?P<value>\d{1,3}\.\d{1,3}\.\d{1,3}
 re_wmi_man = re.compile('Computer Manufacturer : (?P<manufacturer>.*?)\n.*?Computer Model : (?P<model>.*?)\n.*?Computer Memory : (?P<memory>\d+)\s', re.I|re.M|re.S)
 re_shares = re.compile('- (?P<value>.*?)\n', re.I|re.M|re.S)
 re_local_admins = re.compile('- (?P<value>.*?)\s\(', re.I|re.M|re.S)
-re_wsus = re.compile('WUServer: (?P<wsus_server>.*?)\n.*?AUOptions: (?P<wsus_auoption>.*?)\n.*?Detect LastSuccessTime: (?P<wsus_lastdetect>.*?)\n.*?Download LastSuccessTime: (?P<wsus_lastdownload>.*?)\n.*?Install LastSuccessTime: (?P<wsus_lastinstall>.*?)\n.*?RebootRequired: (?P<wsus_rebootneeded>.*?)\n.*?ServiceStatus: (?P<wsus_auenabled>.*?)(\n|$)', re.I|re.M|re.S)
+re_wsus = re.compile('following WSUS server :.*?(?P<wsus_server>http.*?)\n.*?Updates last detected : (?P<wsus_lastdetect>.*?)\n.*?Updates last downloaded : (?P<wsus_lastdownload>.*?)\n.*?Updates last installed : (?P<wsus_lastinstall>.*?)\n.*?AUOptions : (?P<wsus_auoption>.*?)\n', re.I|re.M|re.S)
 re_unix_memory = re.compile('Total memory: (?P<memory>\d+)\s', re.I)
 re_unix_model = re.compile('Serial Number\s+: (?P<serial>.*?)\s.*?\nProduct Name\s+: (?P<model>.*?)(\n|$)', re.I|re.M)
 re_unix_cpu = re.compile('Current Speed\s+: (?P<cpu_speed>.*?)\s*\nManufacturer\s+: (?P<cpu_vendor>.*?)\s*\nFamily\s+: (?P<cpu_model>.*?)\s*\nExternal Clock\s+: (?P<cpu_externalclock>.*?)\s*\nVersion\s+: (?P<cpu_version>.*?)\s*\nType\s+: (?P<cpu_type>.*?)($|\s*\n)', re.I|re.M)
+re_domain = re.compile('^.*?smb domain name is :\s+(?P<domain>.*?)(\s|$)', re.I|re.M)
+re_hostname = re.compile('^Hostname : (?P<hostname>.*?)(\\n|\\r|\s|$)', re.I)
 
 # Plugin to regex map
 # Format is plugin_id: (attribute_name, regex_object, attribute_to_parse, multi_valued)
 REGEX_MAP = {
+'10785': ('', re_domain, 'plugin_output', False),
 '24272': ('ips', re_wmi_ip, 'plugin_output', True),
 '25203': ('ips', re_ip, 'plugin_output', True),
 '24270': ('', re_wmi_man, 'description', False),
 '10395': ('shares', re_shares, 'plugin_output', True),
 '10902': ('local_admins', re_local_admins, 'plugin_output', True),
 '10860': ('local_users', re_local_admins, 'plugin_output', True),
-'55555': ('', re_wsus, 'description', False),
+'50859': ('', re_wsus, 'plugin_output', False),
 '45433': ('', re_unix_memory, 'plugin_output', False),
 '35351': ('', re_unix_model, 'plugin_output', False),
 '45432': ('', re_unix_cpu, 'plugin_output', False),
+'55472': ('', re_hostname, 'plugin_output', False),
 }
 
 # Local IP list
@@ -97,7 +104,7 @@ class Report(object):
 				self.targets.append(rh_obj)
 
 				# Update Report dates
-				if not self.scan_start:
+				if not self.scan_start and rh_obj.get('host_start'):
 					self.scan_start = rh_obj.host_start
 				if not self.scan_end:
 					self.scan_end = rh_obj.host_end
@@ -119,6 +126,7 @@ class Report(object):
 class ReportHost(object):
 	def __init__(self, xml_report_host):
 		self.name = None
+		self.auth = False
 		self.dead = False
 		self.vulns = []
 
@@ -150,6 +158,10 @@ class ReportHost(object):
 		for v in self.find_vuln(plugin_id='10180'):
 			if 'dead' in str(v.get('plugin_output')):
 				self.dead = True
+
+		# Check to see if this was an authenticated scan
+		if self.get('local-checks-proto') and not self.find_vuln(plugin_id='21745'):
+			self.auth = True
 
 		# Parse additional fields into host attributes
 		for plugin_id in REGEX_MAP:
@@ -228,6 +240,14 @@ class ReportHost(object):
 
 		return list(ip_list)
 
+	def get_scanned_ip(self):
+		"""Return the IP address that was scanned"""
+		if re_ip.search(self.name):
+			return self.name
+		elif self.get('host-ip'):
+			return self.get('host-ip')
+		else:
+			return None
 
 	def get_open_ports(self):
 		"""Returns a dict of open ports found"""
@@ -245,13 +265,19 @@ class ReportHost(object):
 			results[proto].append(port)
 		return results
 
-	def get_name(self):
+	def get_name(self, fqdn=True):
 		"""Returns a friendly name for host"""
 		if re_ip.search(self.name):
-			if self.get('netbios-name'):
+			if self.get('hostname'):
+				return self.get('hostname').lower()
+			elif self.get('netbios-name'):
 				return self.get('netbios-name').lower()
 			elif self.get('host-fqdn'):
-				return self.get('host-fqdn').lower()
+				if fqdn:
+					return self.get('host-fqdn').lower()
+				else:
+					return self.get('host-fqdn').lower().split('.')[0]
+
 			else:
 				return self.name
 		else:
@@ -263,10 +289,19 @@ class ReportItem(object):
 		# ...
 
 		# Get ReportItem attributes
-		self.port = xml_report_item.attrib.get('port')
-		self.svc_name = xml_report_item.attrib.get('svc_name')
-		self.protocol = xml_report_item.attrib.get('protocol')
-		self.severity = xml_report_item.attrib.get('severity')
+		#self.port = xml_report_item.attrib.get('port')
+		#self.svc_name = xml_report_item.attrib.get('svc_name')
+		#self.protocol = xml_report_item.attrib.get('protocol')
+		#self.severity = xml_report_item.attrib.get('severity')
+		#self.plugin_id = xml_report_item.attrib.get('pluginID')
+		#self.plugin_name = xml_report_item.attrib.get('pluginName')
+		#self.plugin_family = xml_report_item.attrib.get('pluginFamily')
+
+		# Get ReportItem attributes
+		for k in xml_report_item.attrib.keys():
+			setattr(self, k, xml_report_item.attrib.get(k))
+
+		# Set some attributes to maintain backwards compat from old versions of this script
 		self.plugin_id = xml_report_item.attrib.get('pluginID')
 		self.plugin_name = xml_report_item.attrib.get('pluginName')
 		self.plugin_family = xml_report_item.attrib.get('pluginFamily')
