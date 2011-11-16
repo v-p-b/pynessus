@@ -20,6 +20,7 @@
 #
 # 2010-08-12:	0.1.0: Initial version.
 # 2011-03-12:	0.2.1: Added a bunch of methods and robustified everything.
+# 2011-11-15:	0.2.2: Added delete_report method. (thanks David Lladr!)
 import sys
 import urllib2
 from urlparse import urljoin
@@ -35,6 +36,7 @@ re_unix_timestamp = re.compile('^\d{10}$')
 re_unauthorized = re.compile('<title>200 Unauthorized</title>')
 
 TOKEN_FILE = '.nessus_token'
+CHUNK_SIZE = 51200
 
 # Plugin multi-value tags
 PLUGIN_MULTI_VAL = [
@@ -117,26 +119,62 @@ class NessusServer(object):
 	def download_plugins(self):
 		"""Downloads all plugins"""
 		data = make_args(token=self.token)
-		resp = self._call('plugins/descriptions', data)
+		resp = self._call('plugins/descriptions', data, no_timeout=True)
 
 		# Get parsed data
 		keys = []
 		seq, status, parsed = parse_reply(resp, keys, uniq='pluginID', start_node='pluginsList')
 		return parsed
 
-	def download_report(self, uuid, v1=False):
+	def download_report(self, uuid, v1=False, output_path=None):
 		"""Retrieves a report"""
+		if not self.check_auth():
+			self.login()
+
+		# If output_path given, try to open file for writing
+		if output_path:
+			try:
+				fout = open(output_path, 'wb')
+			except IOError:
+				return False
+
+		# If v1 flag was set, fetch a report in .nessus version 1 format
 		if v1:
 			data = make_args(token=self.token, report=uuid, v1='true')
 		else:
 			data = make_args(token=self.token, report=uuid)
+
+		# Fetch report
 		url = urljoin(self.base_url, 'file/report/download/?%s' % data)
 		req = urllib2.urlopen(url) 
-		resp = req.read()
-		if not check_auth(resp):
-			print >> sys.stderr, "Unauthorized"
-			return None
-		return resp
+
+		# Return or write the report the file
+		if not output_path:
+			resp = req.read()
+			if not check_auth(resp):
+				print >> sys.stderr, "Unauthorized"
+				return False
+			return resp
+
+		else:
+			while True:
+				chunk = req.read(CHUNK_SIZE)
+				fout.write(chunk)
+				if not chunk:
+					break
+			fout.close()
+			return True
+
+	def delete_report(self, uuid):
+		"""Delete a report"""
+		data = make_args(token=self.token, report=uuid)
+		resp = self._call('report/delete', data)
+
+		# Get parsed data
+		keys = []
+		#seq, status, parsed = parse_reply(resp, keys, start_node='pluginsList')
+		seq, status, parsed = parse_reply(resp, keys)
+		return parsed
 
 	def launch_scan(self, name, policy_id, target_list):
 		"""Launches scan. Returns UUID of scan."""
@@ -239,6 +277,34 @@ class NessusServer(object):
 		data = make_args(token=self.token, template_name=quote(name), policy_id=policy_id, target=arg_targets)
 		resp = self._call('/scan/template/new', data)
 
+	def create_schedule(self, name, policy_id, target_list, sched_obj):
+		"""Creates a new scan schedule."""
+		# Create args
+		sched_recur_arg = quote(sched_obj.get_recur_arg())
+		sched_start_arg = sched_obj.dt_to_str()
+		arg_targets = quote('\n'.join(target_list))
+		data = make_args(token=self.token, template_name=quote(name), policy_id=policy_id, target=arg_targets, rRules=sched_recur_arg, startTime=sched_start_arg)
+		resp = self._call('/scan/template/new', data)
+		
+		# Get parsed data
+		keys = ['name']
+		seq, status, parsed = parse_reply(resp, keys, uniq='name', start_node='template')
+		return parsed
+
+	def edit_schedule(self, template_id, name, policy_id, target_list, sched_obj):
+		"""Creates a new scan schedule."""
+		# Create args
+		sched_recur_arg = quote(sched_obj.get_recur_arg())
+		sched_start_arg = sched_obj.dt_to_str()
+		arg_targets = quote('\n'.join(target_list))
+		data = make_args(template=template_id, token=self.token, template_name=quote(name), policy_id=policy_id, target=arg_targets, rRules=sched_recur_arg, startTime=sched_start_arg)
+		resp = self._call('/scan/template/edit', data)
+		
+		# Get parsed data
+		keys = ['name']
+		seq, status, parsed = parse_reply(resp, keys, uniq='name', start_node='template')
+		return parsed
+
 	def edit_template(self, template_id, name, policy_id, target_list):
 		"""Edits an existing scan template."""
 		arg_targets = quote('\n'.join(target_list))
@@ -251,16 +317,30 @@ class NessusServer(object):
 		resp = self._call('scan/list', data)
 
 		# Get parsed data
-		keys = ['policy_id', 'readableName', 'owner', 'startTime']
+		keys = ['policy_id', 'readableName', 'owner', 'startTime', 'rRules', 'target']
 		seq, status, parsed = parse_reply(resp, keys, uniq='name', start_node='templates')
 		return parsed
 
-	def _call(self, func_url, args):
+	def delete_template(self, template_id):
+		"""Creates a new scan schedule."""
+		# Create args
+		data = make_args(template=template_id, token=self.token)
+		resp = self._call('/scan/template/delete', data)
+		
+		# Get parsed data
+		keys = ['name']
+		seq, status, parsed = parse_reply(resp, keys, uniq='name', start_node='template')
+		return parsed
+
+	def _call(self, func_url, args, no_timeout=False):
 		url = urljoin(self.base_url, func_url)
 		if self.verbose:
 			print "URL: '%s'" % url
 			print "POST: '%s'" % args
-		req = urllib2.urlopen(url, args) 
+		if no_timeout:
+			req = urllib2.urlopen(url, args) 
+		else:
+			req = urllib2.urlopen(url, args, timeout=None) 
 		resp = req.read()
 		if not check_auth(resp):
 			print >> sys.stderr, "200 Unauthorized"
@@ -335,7 +415,7 @@ def parse_reply(xml_string, key_list, start_node=None, uniq=None):
 		start_node = 'contents/%s' % start_node
 	else:
 		start_node = 'contents'
-	if not xml.find(start_node):
+	if xml.find(start_node) is None:
 		return (seq, 'start_node not found', {})
 
 	# If a unique value was given, make sure it is a valid tag
@@ -379,71 +459,6 @@ def parse_reply(xml_string, key_list, start_node=None, uniq=None):
 			if not x.text:
 				continue
 			if ((x.tag in key_list) or (not key_list)) and x.text.strip():
-				# If the tag has the word time and the value is a UNIX timestamp, convert it
-				if 'time' in x.tag and re_unix_timestamp.search(x.text):
-					d[x.tag] = convert_date(x.text)
-				else:
-					d[x.tag] = x.text
-	return (seq, status, d)
-
-def parse_reply_orig(xml_string, key_list, start_node=None, uniq=None):
-	"""Gets all key/value pairs from XML"""
-	ROOT_NODES = ['seq', 'status', 'contents']
-	if not xml_string:
-		return (0, 'Not a valid string', {})
-
-	# Parse xml
-	try:
-		xml = ET.fromstring(xml_string)
-	except ET.ExpatError:
-		return (0, 'Cannot parse XML', {})
-
-	# Make sure it looks like what we expect it to be
-	if [t.tag for t in xml.getchildren()] != ROOT_NODES:
-		return (0, 'XML not formatted correctly', {})
-
-	# Get seq and status
-	seq = xml.findtext('seq')
-	status = xml.findtext('status')
-
-	# If start node was given, append it to contents node
-	if start_node:
-		start_node = 'contents/%s' % start_node
-	else:
-		start_node = 'contents'
-	if not xml.find(start_node):
-		return (seq, 'start_node not found', {})
-
-	# If a unique value was given, make sure it is a valid tag
-	if uniq:
-		found = False
-		for x in xml.find(start_node).getiterator():
-			if x.tag == uniq:
-				found = True
-				break
-		if not found:
-			return (seq, 'uniq not a valid tag', {})
-
-	# Parse keys from contents
-	d = {}
-	for x in xml.find(start_node).getiterator():
-		if uniq:
-			# If tag is a unique field, start a new dict
-			if x.tag == uniq:
-				d[x.text] = {}
-				k = x.text
-
-			# Store key/value pair if tag is in key list
-			if x.tag in key_list:
-				# If the tag has the word time and the value is a UNIX timestamp, convert it
-				if 'time' in x.tag and re_unix_timestamp.search(x.text):
-					d[k][x.tag] = convert_date(x.text)
-				else:
-					d[k][x.tag] = x.text
-
-		else:
-			# Store key/value pair if tag is in key list
-			if x.tag in key_list:
 				# If the tag has the word time and the value is a UNIX timestamp, convert it
 				if 'time' in x.tag and re_unix_timestamp.search(x.text):
 					d[x.tag] = convert_date(x.text)
@@ -513,15 +528,16 @@ def parse_tags(xml_string):
 		d[k] = v
 	return (seq, status, d)
 
-def make_args(**kwargs):
+def make_args(add_seq=True, **kwargs):
 	"""Returns arg list suitable for GET or POST requests"""
 	args = []
 	for k in kwargs:
 		args.append('%s=%s' % (k, str(kwargs[k])))
 
 	# Add a random number
-	seq = randint(1, 1000)
-	args.append('seq=%d' % seq)
+	if add_seq:
+		seq = randint(1, 1000)
+		args.append('seq=%d' % seq)
 	
 	return '&'.join(args)
 
@@ -545,3 +561,72 @@ def zerome(string):
 	print "Clearing 0x%08x size %i bytes" % (location, size)
  
 	memset(location, 0, size)
+
+class Schedule(object):
+	# Date format
+	DATE_FORMAT = '%Y%m%dT%H%M%S'
+	# Frequency types
+	FREQ_ONETIME = 'ONETIME'
+	FREQ_DAILY = 'DAILY'
+	FREQ_WEEKLY = 'WEEKLY'
+	FREQ_MONTHLY = 'MONTHLY'
+	FREQ_YEARLY = 'YEARLY'
+
+	# Frequency days
+	FREQ_SUN = 'SU'
+	FREQ_MON = 'MO'
+	FREQ_TUES = 'TU'
+	FREQ_WED = 'WE'
+	FREQ_THURS = 'TH'
+	FREQ_FRI = 'FR'
+	FREQ_SAT = 'SA'
+
+	def __init__(self):
+		self.freq = self.FREQ_ONETIME
+		self.start_dt = datetime.datetime(1900, 1, 1)
+		self.interval = 1
+		self.by_day = []
+
+	def make_sched_onetime(self, start_dt):
+		"""Create onetime scan scheudule"""
+		self.freq = self.FREQ_ONETIME
+		self.start_dt = start_dt
+
+	def make_sched_daily(self, start_dt, interval):
+		"""Create onetime scan scheudule"""
+		self.freq = self.FREQ_ONETIME
+		self.start_dt = start_dt
+		self.interval = interval
+
+	def make_sched_weekly(self, start_dt, repeat_day_list):
+		"""Create onetime scan scheudule"""
+		self.freq = self.FREQ_WEEKLY
+		self.start_dt = start_dt
+		self.by_day.extend(repeat_day_list)
+
+	def dt_to_str(self):
+		if self.start_dt:
+			return self.start_dt.strftime(self.DATE_FORMAT)
+		else:
+			return None
+
+	def get_recur_arg(self):
+		"""Retrieves argument list for schedule"""
+		if not self.freq:
+			return None
+
+		if self.freq == self.FREQ_ONETIME:
+			return 'FREQ=%s' % self.FREQ_ONETIME
+
+		elif self.freq == self.FREQ_DAILY:
+			return ';'.join((
+				'FREQ=%s' % self.FREQ_DAILY,
+				'INTERVAL=%s' % self.interval
+			))
+
+		elif self.freq == self.FREQ_WEEKLY:
+			return ';'.join((
+				'FREQ=%s' % self.FREQ_WEEKLY,
+				'BYDAY=%s' % ','.join(self.by_day),
+			))
+
