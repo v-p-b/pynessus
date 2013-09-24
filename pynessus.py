@@ -183,7 +183,6 @@ class NessusServer(object):
 		while True:
 			resp_status=self._call('report/format/status',data_status)
 			seq_status,status_status,parsed_status=parse_reply(resp_status,['status'])
-			print parsed_status['status']
 			if parsed_status['status']=='ready':
 				break
 			time.sleep(1)
