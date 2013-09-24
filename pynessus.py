@@ -30,6 +30,7 @@ import re
 import datetime
 import os
 from random import randint
+import time
 
 # Regex defs
 re_unix_timestamp = re.compile('^\d{10}$')
@@ -164,6 +165,39 @@ class NessusServer(object):
 					break
 			fout.close()
 			return True
+
+	def download_pdf(self,uuid,output_path):
+		if not self.check_auth():
+			self.login()
+
+		try:
+			fout=open(output_path,'wb')
+		except IOError:
+			return False
+		data=make_args(token=self.token,report=uuid,format="nchapter.pdf",chapters="vuln_hosts_summary%3Bremediations%3Bvuln_by_plugin%3Bvuln_by_host%3Bcompliance_exec%3Bcompliance")
+		resp=self._call('report/format/generate',data)
+		keys=['file']
+		seq,status,parsed = parse_reply(resp,keys)
+		f=urllib2.quote(parsed['file'])
+		data_status=make_args(token=self.token,file=f)
+		while True:
+			resp_status=self._call('report/format/status',data_status)
+			seq_status,status_status,parsed_status=parse_reply(resp_status,['status'])
+			print parsed_status['status']
+			if parsed_status['status']=='ready':
+				break
+			time.sleep(1)
+
+		url = urljoin(self.base_url, 'report/format/download/?%s' % make_args(token=self.token,file=f))
+		req = urllib2.urlopen(url) 
+
+		while True:
+			chunk = req.read(CHUNK_SIZE)
+			fout.write(chunk)
+			if not chunk:
+				break
+		fout.close()
+		return True
 
 	def delete_report(self, uuid):
 		"""Delete a report"""
@@ -392,7 +426,7 @@ def convert_date(unix_timestamp):
 
 def parse_reply(xml_string, key_list, start_node=None, uniq=None):
 	"""Gets all key/value pairs from XML"""
-	ROOT_NODES = ['seq', 'status', 'contents']
+	ROOT_NODES = sorted(['seq', 'status', 'contents'])
 	if not xml_string:
 		return (0, 'Not a valid string', {})
 
@@ -403,7 +437,7 @@ def parse_reply(xml_string, key_list, start_node=None, uniq=None):
 		return (0, 'Cannot parse XML', {})
 
 	# Make sure it looks like what we expect it to be
-	if [t.tag for t in xml.getchildren()] != ROOT_NODES:
+	if sorted([t.tag for t in xml.getchildren()]) != ROOT_NODES:
 		return (0, 'XML not formatted correctly', {})
 
 	# Get seq and status
