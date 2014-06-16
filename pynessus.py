@@ -170,10 +170,6 @@ class NessusServer(object):
 		if not self.check_auth():
 			self.login()
 
-		try:
-			fout=open(output_path,'wb')
-		except IOError:
-			return False
 		data=make_args(token=self.token,report=uuid,format="nchapter.pdf",chapters="vuln_hosts_summary%3Bremediations%3Bvuln_by_plugin%3Bvuln_by_host%3Bcompliance_exec%3Bcompliance")
 		resp=self._call('report/format/generate',data)
 		keys=['file']
@@ -189,9 +185,15 @@ class NessusServer(object):
 
 		url = urljoin(self.base_url, 'report/format/download/?%s' % make_args(token=self.token,file=f))
 		req = urllib2.urlopen(url) 
-
+		print req.info().getheader("Content-Disposition").split("\"")[1]
+		try:
+			fout=open(req.info().getheader("Content-Disposition").split("\"")[1],'wb')
+		except IOError:
+			return False
+		resp=""
 		while True:
 			chunk = req.read(CHUNK_SIZE)
+			resp=resp+chunk
 			fout.write(chunk)
 			if not chunk:
 				break
@@ -465,10 +467,10 @@ def parse_reply(xml_string, key_list, start_node=None, uniq=None):
 	d = {}
 	for x in xml.find(start_node).getiterator():
 		if uniq:
-			# If tag is a unique field, start a new dict
-			if x.tag == uniq:
-				d[x.text] = {}
-				k = x.text
+			# The original code assumed that XML nodes are in a particular order. This is a hack to overcome this issue withouth thouching the rest of this mess...
+			if len(list(x.iter(uniq)))==1 and x.tag!=uniq:
+				k = x.iter(uniq).next().text
+				d[k] = {}
 
 			# Store key/value pair if tag is in key list or if no key list was given
 			if not x.text:
@@ -497,6 +499,7 @@ def parse_reply(xml_string, key_list, start_node=None, uniq=None):
 					d[x.tag] = convert_date(x.text)
 				else:
 					d[x.tag] = x.text
+
 	return (seq, status, d)
 
 def parse_ports(xml_string):
